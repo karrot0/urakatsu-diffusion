@@ -1,0 +1,166 @@
+name: Diffusion
+
+# Builds sd-server from each new stable-diffusion.cpp release with CUDA, which upstream does not
+# publish for Linux, and releases it under the same tag. Urakatsu installs it as its linux-cuda-13
+# build of stable-diffusion.cpp (urakatsu/runtimes/packages.py). The recipe follows Koharu's
+# (github.com/koharu-rs/diffusion), plus the server example Urakatsu runs.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: stable-diffusion.cpp release to build (default the latest)
+        required: false
+  schedule:
+    - cron: '23 */3 * * *'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+jobs:
+  source:
+    name: Resolve the release
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.release.outputs.tag }}
+      build: ${{ steps.release.outputs.build }}
+    steps:
+      - name: Newest stable-diffusion.cpp release not built yet
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REQUESTED: ${{ inputs.tag }}
+        run: |
+          tag=${REQUESTED:-$(gh api repos/leejet/stable-diffusion.cpp/releases/latest --jq .tag_name)}
+          if gh api "repos/$GITHUB_REPOSITORY/releases/tags/$tag" --silent 2>/dev/null; then
+            echo "$tag is already built"
+            build=false
+          else
+            build=true
+          fi
+          printf 'tag=%s\nbuild=%s\n' "$tag" "$build" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: source
+    if: needs.source.outputs.build == 'true'
+    name: ${{ matrix.backend }} / ${{ matrix.target }}
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - backend: cuda-13
+            os: ubuntu-24.04
+            target: linux-x64
+    runs-on: ${{ matrix.os }}
+    env:
+      TAG: ${{ needs.source.outputs.tag }}
+      NAME: ${{ matrix.target }}-${{ matrix.backend }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Check out stable-diffusion.cpp
+        uses: actions/checkout@v7
+        with:
+          repository: leejet/stable-diffusion.cpp
+          ref: ${{ needs.source.outputs.tag }}
+          path: upstream
+          submodules: true
+
+      - name: Install CUDA 13.3
+        uses: Jimver/cuda-toolkit@master
+        with:
+          cuda: '13.3.1'
+          method: network
+          sub-packages: '["nvcc", "cudart", "crt", "thrust"]'
+          non-cuda-sub-packages: '["libcublas", "libcublas-dev"]'
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential cmake ninja-build patchelf
+
+      - name: Configure
+        # Static stable-diffusion and ggml, so sd-server needs only the CUDA libraries packed next
+        # to it ($ORIGIN) and the driver. The architectures are Koharu's: Turing (T4) through
+        # Blackwell, real code for the common ones and PTX for the rest.
+        run: |
+          cmake -S upstream -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DSD_CUDA=ON \
+            "-DCMAKE_CUDA_ARCHITECTURES=75-virtual;80-virtual;86-real;89-real;90-virtual;120a-real;121a-real" \
+            -DSD_BUILD_EXAMPLES=ON \
+            -DSD_BUILD_SHARED_LIBS=OFF \
+            -DSD_BUILD_SHARED_GGML_LIB=OFF \
+            -DSD_WEBP=OFF \
+            -DSD_WEBM=OFF \
+            -DGGML_BACKEND_DL=OFF \
+            -DGGML_CPU_ALL_VARIANTS=OFF \
+            -DGGML_NATIVE=OFF \
+            -DGGML_OPENMP=OFF \
+            -DGGML_CUDA_NCCL=OFF \
+            -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
+            '-DCMAKE_INSTALL_RPATH=$ORIGIN'
+
+      - name: Build sd-server
+        timeout-minutes: 330
+        run: cmake --build build --target sd-server --config Release
+
+      - name: Package
+        run: |
+          server=$(find build -type f -name sd-server -perm -u+x | head -n 1)
+          test -n "$server"
+          mkdir -p package cudart
+          cp "$server" package/sd-server
+          patchelf --set-rpath '$ORIGIN' package/sd-server
+          cp upstream/LICENSE package/LICENSE-stable-diffusion.cpp
+          # The CUDA libraries sd-server loads, under the names it asks for (NVIDIA lets them be
+          # redistributed with the application).
+          lib=$(dirname "$(find /usr/local/cuda* -name 'libcudart.so.13*' -print -quit)")
+          for name in $(readelf -d package/sd-server | sed -n 's/.*Shared library: \[\(libcu[a-zA-Z]*\.so\.[0-9]*\)\].*/\1/p'); do
+            [ "$name" = libcuda.so.1 ] && continue  # the driver's own
+            found=$(find /usr/local/cuda* /usr/lib/x86_64-linux-gnu -name "$name" -print -quit)
+            test -n "$found" || { echo "missing $name"; exit 1; }
+            cp -L "$found" "cudart/$name"
+          done
+          ls -la package cudart
+          readelf -d package/sd-server | grep -E 'NEEDED|RUNPATH'
+          # Everything but the driver resolves from the two archives together.
+          cp cudart/* package/
+          missing=$(LD_LIBRARY_PATH= ldd package/sd-server | grep 'not found' | grep -v 'libcuda.so.1' || true)
+          rm package/libcu*
+          test -z "$missing" || { echo "$missing"; exit 1; }
+          tar -C package -czf "sd-$TAG-bin-$NAME.tar.gz" .
+          tar -C cudart -czf "cudart-sd-$TAG-bin-$NAME.tar.gz" .
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.target }}-${{ matrix.backend }}
+          path: '*.tar.gz'
+          if-no-files-found: error
+          retention-days: 3
+
+  release:
+    needs: [source, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: release
+          merge-multiple: true
+
+      - name: Publish
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ needs.source.outputs.tag }}
+          target_commitish: ${{ github.event.repository.default_branch }}
+          name: stable-diffusion.cpp ${{ needs.source.outputs.tag }} (CUDA)
+          body: |
+            sd-server from [stable-diffusion.cpp ${{ needs.source.outputs.tag }}](https://github.com/leejet/stable-diffusion.cpp/releases/tag/${{ needs.source.outputs.tag }}), built with CUDA 13.3 for Linux x86_64 (NVIDIA driver 580 or newer). The cudart archive holds the CUDA libraries it loads; extract both into one folder.
+          fail_on_unmatched_files: true
+          files: release/*.tar.gz
