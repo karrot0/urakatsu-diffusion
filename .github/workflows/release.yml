@@ -85,13 +85,15 @@ jobs:
 
       - name: Configure
         # Static stable-diffusion and ggml, so sd-server needs only the CUDA libraries packed next
-        # to it ($ORIGIN) and the driver. The architectures are Koharu's: Turing (T4) through
-        # Blackwell, real code for the common ones and PTX for the rest.
+        # to it ($ORIGIN) and the driver. Real code for every GPU from Turing (T4) through
+        # Blackwell, plus compute_90 PTX for newer ones. Unlike Koharu's list, Turing, Ampere A100
+        # and Hopper get real code: their PTX alone needs a driver as new as this toolkit, and the
+        # CUDA 13.0 drivers on Kaggle's and Colab's T4s reject it (CUDA_ERROR_UNSUPPORTED_PTX_VERSION).
         run: |
           cmake -S upstream -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DSD_CUDA=ON \
-            "-DCMAKE_CUDA_ARCHITECTURES=75-virtual;80-virtual;86-real;89-real;90-virtual;120a-real;121a-real" \
+            "-DCMAKE_CUDA_ARCHITECTURES=75-real;80-real;86-real;89-real;90-real;90-virtual;120a-real;121a-real" \
             -DSD_BUILD_EXAMPLES=ON \
             -DSD_BUILD_SHARED_LIBS=OFF \
             -DSD_BUILD_SHARED_GGML_LIB=OFF \
